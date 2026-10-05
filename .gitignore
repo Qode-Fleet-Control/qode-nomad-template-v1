@@ -1,3 +1,9 @@
-.env
 .fleet/
+*.log
 .fleet-deploy.log
+
+# --- Nomad ---
+# a local `nomad agent -dev -data-dir=data` writes here
+data/
+# rendered/variable files that may hold secrets; commit *.nomad.hcl only
+*.vars.hcl

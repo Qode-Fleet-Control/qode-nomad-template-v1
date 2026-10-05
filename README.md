@@ -1,130 +1,77 @@
-# fleet-template-v1
+# Nomad template
 
-## What This Template Is
+Provisioned from [`Qode-Fleet-Control/fleet-template-v1`](https://github.com/Qode-Fleet-Control/fleet-template-v1) — the fleet
+lifecycle contract (`bin/`, `fleet.conf`, `compose.yaml`, deploy workflows) with a set of [Nomad](https://developer.hashicorp.com/nomad) job specifications
+laid on top.
 
-`fleet-template-v1` is a **language-agnostic app lifecycle harness** for apps
-managed by the fleet platform. It gives any app — Node, Python, Go, a Docker
-Compose stack, anything — a uniform way to be deployed and controlled, without
-the fleet needing to know a single thing about your stack.
+**This repo is a job, not a service.** Its container checks the job specs — `nomad fmt
+-check`, then `nomad job validate` and `nomad job plan` (a scheduler dry-run) for each one
+against a throwaway `nomad agent -dev` it starts inside the container on 127.0.0.1 — and
+exits 0 when all of it passes. Nothing is published and nothing listens on `$PORT`.
 
-The fleet injects runtime variables into the environment (`PORT`, `BASE_PATH`,
-`DATABASE_URL`) and calls `./bin/run` to deploy. Everything project-specific —
-how to install, build, and start your app — lives in **one file: `fleet.conf`**.
-That is the only file you edit per project.
+## What is in it
 
-## Repository Structure
+| file | |
+|---|---|
+| `jobs/web.nomad.hcl` | a `service` job: N docker tasks behind a dynamic port, Nomad-native service registration + HTTP check, canary rolling updates with auto-revert, restart policy, `shutdown_delay` |
+| `jobs/cleanup.nomad.hcl` | a periodic `batch` job (nightly cron, no overlap) |
+| `scripts/check.sh` | the job: `nomad fmt -check -recursive jobs`, dev agent up, `job validate` + `job plan` per spec, agent down |
 
-```
-fleet.conf        ← the only file you edit per project
-.env              ← local-only env vars (gitignored)
-bin/
-  _common.sh      ← shared logic; never edit this
-  run             ← install + build + start (called by the fleet)
-  start           ← start only (no rebuild)
-  restart         ← stop + full run
-  reload          ← hot-reload config without rebuild
-  stop            ← stop the running process
-```
+Both specs use HCL2 `variable` blocks — override with `-var` / `-var-file` at run time:
 
-## The One File You Edit: `fleet.conf`
+    nomad job run -var="image=nginx:1.29-alpine" -var="count=3" jobs/web.nomad.hcl
 
-`fleet.conf` is sourced as shell by the lifecycle scripts. Fill in the commands
-for your stack; leave any command empty (`''`) to skip that step.
+## Run it
 
-```sh
-NAME="my-app"           # label shown in fleet logs
-PORT="3000"             # default port (fleet overrides via $PORT env var)
-HEALTH_PATH="/"         # HTTP path that returns 200 when the app is ready
+**On the fleet:** `bin/run` builds the image (`docker compose build`) and stops there —
+`DOCKER_START_CMD` is empty because there is no server. Run the job with
+`docker compose run --rm app`.
 
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/server.js'   # must listen on $PORT; run in foreground
-RELOAD_CMD=''           # optional; empty → falls back to stop+start
-```
+**With docker:**
 
-> **Critical rule:** single-quote any command that uses `$PORT` or
-> `$BASE_PATH`. Single quotes defer variable expansion to **runtime** — when the
-> command actually runs, with the fleet-injected value — rather than at the
-> moment `fleet.conf` is sourced (when those values aren't set yet). Use
-> `START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'`, never double quotes.
+    docker compose build
+    docker compose run --rm app        # exit 0 = fmt, validate and plan passed for every spec
 
-## How the Lifecycle Works
+**Without docker** (needs `nomad` >= 1.5 on `PATH`):
 
-| Script | What it does | When to use |
-| --- | --- | --- |
-| `bin/run` | `INSTALL_CMD` → `BUILD_CMD` → `START_CMD` | Fleet deploy, fresh start |
-| `bin/start` | `START_CMD` only | Restart without rebuild |
-| `bin/restart` | stop + `bin/run` | After a code/dep change |
-| `bin/reload` | `RELOAD_CMD`, or stop+start if empty | After a config-only change |
-| `bin/stop` | Kill by pidfile or port | Tear down |
+    sh scripts/check.sh                # starts/stops its own dev agent on 127.0.0.1:${NOMAD_DEV_PORT:-4646}
+    NOMAD_ADDR=http://your-cluster:4646 nomad job run jobs/web.nomad.hcl
 
-> The process PID is written to `.fleet/app.pid` so subsequent `stop`/`restart`
-> calls can find and terminate it reliably. If the pidfile is missing or stale,
-> `stop` falls back to freeing whatever is listening on `$PORT`.
+`FLEET_RUNTIME=process bin/run` runs `BUILD_CMD` (`nomad fmt -check`) and then stops at the
+start step, by design.
 
-## How to Apply This to Your Project
+## Origin
 
-### Step 1 — Copy the template into your repo
+    hand-written — Nomad ships `nomad job init`, but it writes a single example.nomad.hcl
+    demo (a redis task); these specs follow the job-specification docs instead
 
-```sh
-cp -r fleet-template-v1/* my-project/
-```
+## Deviations, and why
 
-Or, if starting fresh, just clone it and work from `main`.
+- `Dockerfile` is a job image on `hashicorp/nomad:2.0.7`: its `ENTRYPOINT` is cleared and the
+  default command is `scripts/check.sh`. Runs as non-root `app` (uid 10001).
+- The check uses a dev agent rather than plain offline `nomad job validate`: offline
+  validation skips the server-side checks, and `nomad job plan` needs a scheduler. The
+  container has no docker daemon, so the docker driver's own `config {}` schema is not
+  checked (Nomad only checks it when the driver is loaded); a typo inside `config {}` is
+  found by `nomad job run` on a real cluster.
+- `nomad job plan` exits 1 when the job would create allocations — the normal result for a
+  new job — so the check accepts 0 and 1 and fails on anything higher.
 
-### Step 2 — Edit `fleet.conf` (the only required change)
+## Verified
 
-Fill in your stack's commands. Per-stack examples:
+**The docker job has NOT been verified yet.** On 2026-10-05 the build host's docker disk
+stayed below the 6 GB floor (0-3 GB free) for over three hours, so `docker compose build`
+was never run for this repo. Build and run it once before trusting it:
 
-```sh
-# Node.js
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/index.js'
+    docker compose build && docker compose run --rm app; docker compose down --rmi local -v
 
-# Python (Gunicorn)
-INSTALL_CMD='pip install -r requirements.txt'
-BUILD_CMD=''
-START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'
+What WAS checked, with the real CLIs outside docker (same `scripts/check.sh` the image runs):
 
-# Go
-INSTALL_CMD=''
-BUILD_CMD='go build -o ./out/server ./cmd/server'
-START_CMD='./out/server'
+    nomad 2.0.7: sh scripts/check.sh        # fmt ok; dev agent up; validate + plan of web and cleanup
+                                            # ("All tasks successfully allocated") -> exit 0, agent stopped
 
-# Docker Compose
-INSTALL_CMD=''
-BUILD_CMD='docker compose build'
-START_CMD='docker compose up'
-RELOAD_CMD='docker compose up -d --no-build'
-```
+## Serving over HTTP
 
-### Step 3 — Set local env vars in `.env` (gitignored)
-
-```sh
-APP_NAME=My App
-DATABASE_URL=postgres://localhost/mydb
-```
-
-### Step 4 — Verify standalone
-
-```sh
-PORT=3001 bin/run      # should install, build, and serve on 3001
-curl http://localhost:3001/   # should 200
-```
-
-### Step 5 — Connect to the fleet
-
-Point the fleet at your repo. It will clone it, inject `PORT` / `BASE_PATH` /
-`DATABASE_URL`, and call `bin/run`. As long as your `START_CMD` listens on
-`$PORT` and `HEALTH_PATH` returns 200, the fleet will mark the app healthy.
-
-## Key Invariants
-
-- **`START_CMD` must run in the foreground and listen on `$PORT`.** Do not use a
-  dev server — HMR / hot-reload chunks 404 behind the ingress and will break the
-  app.
-- **Never put secrets in `fleet.conf`** — it's committed. Use `.env` locally;
-  the fleet injects secrets via the environment.
-- **`bin/_common.sh` is shared infrastructure** — don't edit it per project. All
-  project-specific configuration belongs in `fleet.conf`.
+There is no HTTP surface. If you add one, listen on `0.0.0.0:$PORT`, serve at `/`, set
+`PORT`, `HEALTH_PATH`, `START_CMD` and `DOCKER_START_CMD` in `fleet.conf`, and publish
+`"${PORT}:${PORT}"` in `compose.yaml`. See `docs/fleet-lifecycle.md`.
